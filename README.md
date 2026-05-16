@@ -48,6 +48,7 @@ Add to `cline_mcp_settings.json`:
 {
   "mcpServers": {
     "digipulse": {
+      "type": "streamableHttp",
       "url": "http://localhost:3001/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_API_TOKEN"
