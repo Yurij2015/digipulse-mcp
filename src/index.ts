@@ -1,10 +1,10 @@
 import express from "express";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import axios from "axios";
 import dotenv from "dotenv";
-import crypto from "crypto";
+import { randomUUID } from "crypto";
 
 dotenv.config();
 
@@ -12,10 +12,10 @@ const API_URL = process.env.DIGIPULSE_API_URL || "http://localhost/api/v1";
 const FRONTEND_KEY = process.env.DIGIPULSE_FRONTEND_KEY || "digipulse_development_key";
 
 const app = express();
+app.use(express.json());
 const port = process.env.PORT || 3001;
 
-// Map to store active transports per session
-const transports = new Map<string, SSEServerTransport>();
+const transports = new Map<string, StreamableHTTPServerTransport>();
 
 // Helper to create a user-specific server instance
 function createServerForUser(apiToken: string) {
@@ -115,50 +115,79 @@ Then, generate a report highlighting:
   return server;
 }
 
-// SSE Connection Endpoint
-app.get("/sse", async (req, res) => {
-  // Extract token from Authorization header or query param
+app.post("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  if (sessionId) {
+    const transport = transports.get(sessionId);
+    if (!transport) {
+      res.status(404).json({ error: "Session not found or expired" });
+      return;
+    }
+    await transport.handleRequest(req, res);
+    return;
+  }
+
   let token = req.query.token as string;
   if (!token && req.headers.authorization?.startsWith("Bearer ")) {
     token = req.headers.authorization.split(" ")[1];
   }
 
+  // Fallback to .env for easy local testing
+  if (!token && process.env.DIGIPULSE_API_TOKEN) {
+    token = process.env.DIGIPULSE_API_TOKEN;
+  }
+
   if (!token) {
-    res.status(401).send("Unauthorized: Missing API token. Please provide ?token=...");
+    res.status(401).json({ error: "Unauthorized: Missing API token. Add DIGIPULSE_API_TOKEN to .env for local testing." });
     return;
   }
 
-  const sessionId = crypto.randomUUID();
-  const transport = new SSEServerTransport(`/message?sessionId=${sessionId}`, res);
-  
-  transports.set(sessionId, transport);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sid) => {
+      transports.set(sid, transport);
+      console.log(`[+] New MCP session established (Session: ${sid})`);
+    },
+  });
+
+  transport.onclose = () => {
+    if (transport.sessionId) {
+      transports.delete(transport.sessionId);
+      console.log(`[-] MCP session closed (Session: ${transport.sessionId})`);
+    }
+  };
 
   const server = createServerForUser(token);
   await server.connect(transport);
-
-  console.log(`[+] New SSE connection established (Session: ${sessionId})`);
-
-  // Clean up when client disconnects
-  req.on("close", () => {
-    console.log(`[-] SSE connection closed (Session: ${sessionId})`);
-    transports.delete(sessionId);
-  });
+  await transport.handleRequest(req, res);
 });
 
-// Messages Endpoint
-app.post("/message", async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  const transport = transports.get(sessionId);
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  const transport = sessionId ? transports.get(sessionId) : undefined;
 
   if (!transport) {
-    res.status(404).send("Session not found or expired.");
+    res.status(404).json({ error: "Session not found or expired" });
     return;
   }
 
-  await transport.handlePostMessage(req, res);
+  await transport.handleRequest(req, res);
+});
+
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  const transport = sessionId ? transports.get(sessionId) : undefined;
+
+  if (!transport) {
+    res.status(404).json({ error: "Session not found or expired" });
+    return;
+  }
+
+  await transport.handleRequest(req, res);
 });
 
 app.listen(port, () => {
-  console.log(`DigiPulse MCP Server (SSE) running on http://localhost:${port}`);
-  console.log(`Connect clients to http://localhost:${port}/sse?token=<API_TOKEN>`);
+  console.log(`DigiPulse MCP Server running on http://localhost:${port}`);
+  console.log(`Connect clients to http://localhost:${port}/mcp`);
 });
