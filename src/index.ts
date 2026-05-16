@@ -55,8 +55,23 @@ function createServerForUser(apiToken: string) {
     version: "1.0.0",
   });
 
+  const siteSchema = z.object({
+    id: z.number(),
+    name: z.string(),
+    url: z.string(),
+    status: z.string().nullable(),
+    uptime: z.number().nullable(),
+    response_time: z.number().nullable(),
+    last_checked_at: z.string().nullable(),
+    ssl_valid: z.boolean().nullable(),
+    ssl_expires_at: z.string().nullable(),
+    project_id: z.number().nullable(),
+  });
+
   server.registerTool("digipulse_list_sites", {
-    description: "Get all monitored sites",
+    title: "List Monitored Sites",
+    description: "Get all monitored sites with current status, uptime, response time, and SSL info",
+    outputSchema: { sites: z.array(siteSchema) },
   }, async () => {
     try {
       const response = await apiClient.get("/sites");
@@ -64,42 +79,70 @@ function createServerForUser(apiToken: string) {
         id: s.id,
         name: s.name,
         url: s.url,
-        status: s.status,
-        uptime: s.uptime,
-        response_time: s.response_time,
-        last_checked_at: s.last_checked_at,
+        status: s.status ?? null,
+        uptime: s.uptime ?? null,
+        response_time: s.response_time ?? null,
+        last_checked_at: s.last_checked_at ?? null,
         ssl_valid: s.ssl_info?.valid ?? null,
         ssl_expires_at: s.ssl_info?.expires_at ?? null,
-        project_id: s.project_id,
+        project_id: s.project_id ?? null,
       }));
-      return { content: [{ type: "text", text: JSON.stringify(sites, null, 2) }] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(sites, null, 2) }],
+        structuredContent: { sites },
+      };
     } catch (error: any) {
       return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
     }
   });
 
   server.registerTool("digipulse_list_projects", {
-    description: "Get all projects",
+    title: "List Projects",
+    description: "Get all projects with their site count",
+    outputSchema: {
+      projects: z.array(z.object({
+        id: z.number(),
+        name: z.string(),
+        description: z.string().nullable(),
+        sites_count: z.number(),
+      })),
+    },
   }, async () => {
     try {
       const response = await apiClient.get("/projects");
       const projects = response.data.data.map((p: any) => ({
         id: p.id,
         name: p.name,
-        description: p.description,
+        description: p.description ?? null,
         sites_count: p.sites_count,
       }));
-      return { content: [{ type: "text", text: JSON.stringify(projects, null, 2) }] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(projects, null, 2) }],
+        structuredContent: { projects },
+      };
     } catch (error: any) {
       return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
     }
   });
 
   server.registerTool("digipulse_get_site_history", {
+    title: "Get Site History",
     description: "Get hourly aggregated stats and downtime incidents for a site. Defaults to current week.",
     inputSchema: {
       site_id: z.number(),
       week: z.string().optional().describe("ISO week string, e.g. 2025-W20"),
+    },
+    outputSchema: {
+      stats: z.array(z.object({
+        timestamp: z.string(),
+        avg_response_time: z.number(),
+        uptime_percentage: z.number(),
+      })),
+      incidents: z.array(z.object({
+        checked_at: z.string(),
+        response_time_ms: z.number().nullable(),
+        error: z.string().nullable(),
+      })),
     },
   }, async ({ site_id, week }) => {
     try {
@@ -114,11 +157,14 @@ function createServerForUser(apiToken: string) {
         })),
         incidents: (incidents ?? []).slice(0, 20).map((i: any) => ({
           checked_at: i.checked_at,
-          response_time_ms: i.response_time_ms,
+          response_time_ms: i.response_time_ms ?? null,
           error: i.error ?? null,
         })),
       };
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        structuredContent: result,
+      };
     } catch (error: any) {
       return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
     }
@@ -127,7 +173,7 @@ function createServerForUser(apiToken: string) {
   server.registerResource(
     "site-details",
     new ResourceTemplate("digipulse://sites/{id}", { list: undefined }),
-    { description: "Site details by ID" },
+    { title: "Site Details", description: "Full site details by ID" },
     async (uri, params) => {
       const id = (params as any).id;
       try {
@@ -145,6 +191,7 @@ function createServerForUser(apiToken: string) {
   );
 
   server.registerPrompt("audit_sites", {
+    title: "Audit Sites",
     description: "Generate a complete health audit of all monitored sites",
     argsSchema: {
       projectId: z.string().optional().describe("Optional project ID to filter the audit"),
