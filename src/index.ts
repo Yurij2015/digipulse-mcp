@@ -15,7 +15,30 @@ const app = express();
 app.use(express.json());
 const port = process.env.PORT || 3001;
 
-const transports = new Map<string, StreamableHTTPServerTransport>();
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+interface Session {
+  transport: StreamableHTTPServerTransport;
+  lastActivity: number;
+}
+
+const sessions = new Map<string, Session>();
+
+function touchSession(sessionId: string) {
+  const session = sessions.get(sessionId);
+  if (session) session.lastActivity = Date.now();
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.lastActivity > SESSION_TTL_MS) {
+      session.transport.close();
+      sessions.delete(id);
+      console.log(`[~] Session expired (Session: ${id})`);
+    }
+  }
+}, 60_000);
 
 // Helper to create a user-specific server instance
 function createServerForUser(apiToken: string) {
@@ -119,12 +142,13 @@ app.post("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   if (sessionId) {
-    const transport = transports.get(sessionId);
-    if (!transport) {
+    const session = sessions.get(sessionId);
+    if (!session) {
       res.status(404).json({ error: "Session not found or expired" });
       return;
     }
-    await transport.handleRequest(req, res);
+    touchSession(sessionId);
+    await session.transport.handleRequest(req, res, req.body);
     return;
   }
 
@@ -133,7 +157,6 @@ app.post("/mcp", async (req, res) => {
     token = req.headers.authorization.split(" ")[1];
   }
 
-  // Fallback to .env for easy local testing
   if (!token && process.env.DIGIPULSE_API_TOKEN) {
     token = process.env.DIGIPULSE_API_TOKEN;
   }
@@ -146,45 +169,46 @@ app.post("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (sid) => {
-      transports.set(sid, transport);
+      sessions.set(sid, { transport, lastActivity: Date.now() });
       console.log(`[+] New MCP session established (Session: ${sid})`);
     },
   });
 
   transport.onclose = () => {
     if (transport.sessionId) {
-      transports.delete(transport.sessionId);
+      sessions.delete(transport.sessionId);
       console.log(`[-] MCP session closed (Session: ${transport.sessionId})`);
     }
   };
 
   const server = createServerForUser(token);
   await server.connect(transport);
-  await transport.handleRequest(req, res);
+  await transport.handleRequest(req, res, req.body);
 });
 
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const transport = sessionId ? transports.get(sessionId) : undefined;
+  const session = sessionId ? sessions.get(sessionId) : undefined;
 
-  if (!transport) {
+  if (!session) {
     res.status(404).json({ error: "Session not found or expired" });
     return;
   }
 
-  await transport.handleRequest(req, res);
+  touchSession(sessionId!);
+  await session.transport.handleRequest(req, res);
 });
 
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const transport = sessionId ? transports.get(sessionId) : undefined;
+  const session = sessionId ? sessions.get(sessionId) : undefined;
 
-  if (!transport) {
+  if (!session) {
     res.status(404).json({ error: "Session not found or expired" });
     return;
   }
 
-  await transport.handleRequest(req, res);
+  await session.transport.handleRequest(req, res);
 });
 
 app.listen(port, () => {
