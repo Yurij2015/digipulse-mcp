@@ -1,45 +1,21 @@
-import express from "express";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import axios from "axios";
-import dotenv from "dotenv";
 import { randomUUID } from "crypto";
 
-dotenv.config();
+const USE_HTTP = !!process.env.PORT;
+
+if (USE_HTTP) {
+  const { default: dotenv } = await import("dotenv");
+  dotenv.config();
+}
 
 const API_URL = process.env.DIGIPULSE_API_URL || "http://localhost/api/v1";
 const FRONTEND_KEY = process.env.DIGIPULSE_FRONTEND_KEY || "digipulse_development_key";
 
-const app = express();
-app.use(express.json());
-const port = process.env.PORT || 3001;
-
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-interface Session {
-  transport: StreamableHTTPServerTransport;
-  lastActivity: number;
-}
-
-const sessions = new Map<string, Session>();
-
-function touchSession(sessionId: string) {
-  const session = sessions.get(sessionId);
-  if (session) session.lastActivity = Date.now();
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.lastActivity > SESSION_TTL_MS) {
-      session.transport.close().then(r => {});
-      sessions.delete(id);
-    }
-  }
-}, 60_000);
-
-function createServerForUser(apiToken: string) {
+function createServer(apiToken: string) {
   const apiClient = axios.create({
     baseURL: API_URL,
     headers: {
@@ -179,10 +155,7 @@ function createServerForUser(apiToken: string) {
       try {
         const response = await apiClient.get(`/sites/${id}`);
         return {
-          contents: [{
-            uri: uri.href,
-            text: JSON.stringify(response.data.data, null, 2)
-          }]
+          contents: [{ uri: uri.href, text: JSON.stringify(response.data.data, null, 2) }]
         };
       } catch (error: any) {
         throw new Error(`Failed to fetch site ${id}: ${error.message}`);
@@ -201,12 +174,12 @@ function createServerForUser(apiToken: string) {
       role: "user",
       content: {
         type: "text",
-        text: `Please run a comprehensive health audit on my DigiPulse monitored sites ${projectId ? ` for project ID ${projectId}` : ''}.
-              First, use the 'digipulse_list_sites' tool to retrieve the current statuses.
-              Then, generate a report highlighting:
-              1. Sites that are currently DOWN.
-              2. Sites with high latency or SSL issues.
-              3. A general summary of the infrastructure health.`
+        text: `Please run a comprehensive health audit on my DigiPulse monitored sites${projectId ? ` for project ID ${projectId}` : ''}.
+First, use the 'digipulse_list_sites' tool to retrieve the current statuses.
+Then, generate a report highlighting:
+1. Sites that are currently DOWN.
+2. Sites with high latency or SSL issues.
+3. A general summary of the infrastructure health.`
       }
     }]
   }));
@@ -214,73 +187,88 @@ function createServerForUser(apiToken: string) {
   return server;
 }
 
-app.post("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+if (USE_HTTP) {
+  const { default: express } = await import("express");
+  const app = express();
+  app.use(express.json());
 
-  if (sessionId) {
-    const session = sessions.get(sessionId);
-    if (!session) {
-      res.status(404).json({ error: "Session not found or expired" });
+  const port = parseInt(process.env.PORT!);
+  const SESSION_TTL_MS = 30 * 60 * 1000;
+
+  interface Session {
+    transport: StreamableHTTPServerTransport;
+    lastActivity: number;
+  }
+
+  const sessions = new Map<string, Session>();
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of sessions) {
+      if (now - session.lastActivity > SESSION_TTL_MS) {
+        session.transport.close();
+        sessions.delete(id);
+      }
+    }
+  }, 60_000);
+
+  app.post("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+    if (sessionId) {
+      const session = sessions.get(sessionId);
+      if (!session) {
+        res.status(404).json({ error: "Session not found or expired" });
+        return;
+      }
+      session.lastActivity = Date.now();
+      await session.transport.handleRequest(req, res, req.body);
       return;
     }
-    touchSession(sessionId);
-    await session.transport.handleRequest(req, res, req.body);
-    return;
-  }
 
-  let token = req.query.token as string;
-  if (!token && req.headers.authorization?.startsWith("Bearer ")) {
-    token = req.headers.authorization.split(" ")[1];
-  }
+    let token = req.query.token as string;
+    if (!token && req.headers.authorization?.startsWith("Bearer ")) {
+      token = req.headers.authorization.split(" ")[1];
+    }
+    if (!token) token = process.env.DIGIPULSE_API_TOKEN || "";
 
-  if (!token && process.env.DIGIPULSE_API_TOKEN) {
-    token = process.env.DIGIPULSE_API_TOKEN;
-  }
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        sessions.set(sid, { transport, lastActivity: Date.now() });
+      },
+    });
 
-  if (!token) {
-    res.status(401).json({ error: "Unauthorized: Missing API token. Add DIGIPULSE_API_TOKEN to .env for local testing." });
-    return;
-  }
+    transport.onclose = () => {
+      if (transport.sessionId) sessions.delete(transport.sessionId);
+    };
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (sid) => {
-      sessions.set(sid, { transport, lastActivity: Date.now() });
-    },
+    const server = createServer(token);
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
   });
 
-  transport.onclose = () => {
-    if (transport.sessionId) sessions.delete(transport.sessionId);
-  };
+  app.get("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session) { res.status(404).json({ error: "Session not found" }); return; }
+    session.lastActivity = Date.now();
+    await session.transport.handleRequest(req, res);
+  });
 
-  const server = createServerForUser(token);
+  app.delete("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session) { res.status(404).json({ error: "Session not found" }); return; }
+    await session.transport.handleRequest(req, res);
+  });
+
+  app.listen(port, () => {
+    process.stderr.write(`DigiPulse MCP server (HTTP) running on http://localhost:${port}/mcp\n`);
+  });
+} else {
+  const token = process.env.DIGIPULSE_API_TOKEN || "";
+  const server = createServer(token);
+  const transport = new StdioServerTransport();
   await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-});
-
-app.get("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (!session) {
-    res.status(404).json({ error: "Session not found or expired" });
-    return;
-  }
-
-  touchSession(sessionId!);
-  await session.transport.handleRequest(req, res);
-});
-
-app.delete("/mcp", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (!session) {
-    res.status(404).json({ error: "Session not found or expired" });
-    return;
-  }
-
-  await session.transport.handleRequest(req, res);
-});
-
-app.listen(port);
+}
