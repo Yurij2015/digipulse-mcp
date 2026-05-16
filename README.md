@@ -1,61 +1,110 @@
-# DigiPulse MCP Agent Integration Guide
+# DigiPulse MCP Server
 
-This document describes how to connect an AI Agent (like Claude Desktop or Cursor) to your DigiPulse account using the Model Context Protocol (MCP).
+MCP server for DigiPulse — gives AI agents (Cline, Claude Desktop, Cursor) read access to your monitoring data.
 
-## Architecture
+## Transport
 
-DigiPulse uses a **Remote SSE (Server-Sent Events)** architecture for MCP. 
-This means the entire MCP server runs on DigiPulse's infrastructure. You don't need to download or execute any third-party scripts locally on your machine. Your AI assistant simply makes secure HTTP requests to our server.
+Uses **Streamable HTTP** (`/mcp` endpoint) — the current MCP standard.
 
-## How to Connect
+## Running
 
-To connect, you need two things:
-1. **DigiPulse MCP Server URL:** `https://mcp.digi-pulse.com/sse` (replace with the actual production domain).
-2. **Your Personal API Token:** You can generate this in your DigiPulse profile under `Settings -> API Keys`.
+```bash
+# Development (auto-reload)
+npm run dev
 
-### 1. Connecting via Cursor IDE
+# Production
+npm run build
+npm start
+```
 
-If you are using Cursor:
-1. Open `Cursor Settings` -> `Features` -> `MCP Servers`.
-2. Click `+ Add New MCP Server`.
-3. Select Type: **SSE**.
-4. Name: `DigiPulse`.
-5. URL: `https://mcp.digi-pulse.com/sse?token=YOUR_API_TOKEN`.
-6. Click Save. Cursor now has access to your monitoring data!
+Server starts on `http://localhost:3001` (or `PORT` from env).
 
-### 2. Connecting via Claude Desktop
+## Authentication
 
-Currently, the Claude Desktop application requires a local command in its configuration to bridge to remote servers. You will need to add a short JSON snippet to your configuration file.
+Token is required on session initialization. Pass it via:
 
-Open your Claude configuration file (via `Developer` -> `Edit Config`):
+- `Authorization: Bearer <token>` header
+- `?token=<token>` query param
+- `DIGIPULSE_API_TOKEN` in `.env` (local fallback)
 
-**Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`  
-**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+## Environment Variables
 
-Add the following configuration:
+Copy `.env.example` to `.env` and fill in:
+
+```env
+DIGIPULSE_API_URL=http://localhost/api/v1
+DIGIPULSE_FRONTEND_KEY=your_frontend_key
+DIGIPULSE_API_TOKEN=your_sanctum_token
+PORT=3001
+```
+
+## Connecting Agents
+
+### Cline
+
+Add to `cline_mcp_settings.json`:
 
 ```json
 {
   "mcpServers": {
     "digipulse": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-proxy", 
-        "https://mcp.digi-pulse.com/sse?token=YOUR_API_TOKEN"
-      ]
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_TOKEN"
+      }
     }
   }
 }
 ```
 
-*Note: This configuration uses the community standard `mcp-proxy` utility, which acts as a lightweight local tunnel connecting Claude to our remote server. No business logic or API keys are stored locally.*
+### Claude Desktop
 
-## What can the Agent do?
+Add to `claude_desktop_config.json`:
 
-Once connected, you can ask your agent:
-- *"What is the current status of my monitored sites in DigiPulse?"*
-- *"List all my projects."*
-- *"Add the site https://example.com to my monitoring list under project X."*
+```json
+{
+  "mcpServers": {
+    "digipulse": {
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_TOKEN"
+      }
+    }
+  }
+}
+```
 
-The agent will automatically select the right tool, authenticate using your token, fetch the data, and present the results in a human-readable format.
+### Testing with MCP Inspector
+
+```bash
+npx @modelcontextprotocol/inspector
+```
+
+Open the Inspector UI → set transport to **Streamable HTTP** → connect to `http://localhost:3001/mcp`.
+
+## Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `digipulse_list_sites` | All monitored sites with status, uptime, response time, SSL info |
+| `digipulse_list_projects` | All projects with site count |
+| `digipulse_get_site_history` | Hourly stats and downtime incidents for a site (by week) |
+
+## Available Resources
+
+| Resource | URI | Description |
+|----------|-----|-------------|
+| `site-details` | `digipulse://sites/{id}` | Full site details by ID |
+
+## Available Prompts
+
+| Prompt | Description |
+|--------|-------------|
+| `audit_sites` | Generate a health audit report for all monitored sites |
+
+## Example Queries
+
+- *"What is the current status of my monitored sites?"*
+- *"Show me sites that are down or have SSL issues."*
+- *"Analyze the uptime history for site 5 this week."*
+- *"Run a full infrastructure health audit."*
