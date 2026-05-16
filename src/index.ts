@@ -95,7 +95,36 @@ function createServerForUser(apiToken: string) {
     }
   });
 
-server.registerResource(
+  server.registerTool("digipulse_get_site_history", {
+    description: "Get hourly aggregated stats and downtime incidents for a site. Defaults to current week.",
+    inputSchema: {
+      site_id: z.number(),
+      week: z.string().optional().describe("ISO week string, e.g. 2025-W20"),
+    },
+  }, async ({ site_id, week }) => {
+    try {
+      const params = week ? { week } : {};
+      const response = await apiClient.get(`/sites/${site_id}/history`, { params });
+      const { stats, incidents } = response.data.data;
+      const result = {
+        stats: (stats ?? []).map((s: any) => ({
+          timestamp: s.timestamp,
+          avg_response_time: s.avg_response_time,
+          uptime_percentage: s.uptime_percentage,
+        })),
+        incidents: (incidents ?? []).slice(0, 20).map((i: any) => ({
+          checked_at: i.checked_at,
+          response_time_ms: i.response_time_ms,
+          error: i.error ?? null,
+        })),
+      };
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  });
+
+  server.registerResource(
     "site-details",
     new ResourceTemplate("digipulse://sites/{id}", { list: undefined }),
     { description: "Site details by ID" },
