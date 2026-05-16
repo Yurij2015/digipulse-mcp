@@ -33,7 +33,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions) {
     if (now - session.lastActivity > SESSION_TTL_MS) {
-      session.transport.close();
+      session.transport.close().then(r => {});
       sessions.delete(id);
     }
   }
@@ -95,23 +95,7 @@ function createServerForUser(apiToken: string) {
     }
   });
 
-  server.registerTool("digipulse_add_site", {
-    description: "Add a new site to monitor",
-    inputSchema: {
-      name: z.string(),
-      url: z.url(),
-      project_id: z.number().optional(),
-    },
-  }, async ({ name, url, project_id }) => {
-    try {
-      const response = await apiClient.post("/sites", { name, url, project_id });
-      return { content: [{ type: "text", text: `Site added: ${JSON.stringify(response.data.data)}` }] };
-    } catch (error: any) {
-      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
-    }
-  });
-
-  server.registerResource(
+server.registerResource(
     "site-details",
     new ResourceTemplate("digipulse://sites/{id}", { list: undefined }),
     { description: "Site details by ID" },
