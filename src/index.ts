@@ -35,66 +35,59 @@ function createServer(apiToken: string) {
     id: z.number(),
     name: z.string(),
     url: z.string(),
-    status: z.string().nullable(),
+    status: z.string(),
     uptime: z.number().nullable(),
     response_time: z.number().nullable(),
     last_checked_at: z.string().nullable(),
+    project_id: z.number().nullable(),
+    project_name: z.string().nullable(),
     ssl_valid: z.boolean().nullable(),
     ssl_expires_at: z.string().nullable(),
-    project_id: z.number().nullable(),
+    ssl_days_remaining: z.number().nullable(),
   });
 
-  server.registerTool("digipulse_list_sites", {
-    title: "List Monitored Sites",
-    description: "Get all monitored sites with current status, uptime, response time, and SSL info",
-    outputSchema: { sites: z.array(siteSchema) },
-  }, async () => {
-    try {
-      const response = await apiClient.get("/sites");
-      const sites = response.data.data.map((s: any) => ({
-        id: s.id,
-        name: s.name,
-        url: s.url,
-        status: s.status ?? null,
-        uptime: s.uptime ?? null,
-        response_time: s.response_time ?? null,
-        last_checked_at: s.last_checked_at ?? null,
-        ssl_valid: s.ssl_info?.valid ?? null,
-        ssl_expires_at: s.ssl_info?.expires_at ?? null,
-        project_id: s.project_id ?? null,
-      }));
-      return {
-        content: [{ type: "text", text: JSON.stringify(sites, null, 2) }],
-        structuredContent: { sites },
-      };
-    } catch (error: any) {
-      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
-    }
-  });
+  server.registerTool("digipulse_get_overview", {
+    title: "Get Monitoring Overview",
+    description: `Returns a full account snapshot: all projects (with site counts and status summaries), all sites (with current status, uptime %, response time, SSL validity and days-until-expiry).
 
-  server.registerTool("digipulse_list_projects", {
-    title: "List Projects",
-    description: "Get all projects with their site count",
+Use this as the default first call. It answers the majority of monitoring questions — "are all sites up?", "which project has issues?", "is SSL about to expire?" — in a single request without follow-up calls.
+
+Optionally filter to a single project with project_id.`,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      project_id: z.number().optional().describe("Optional. Filter results to a single project. Omit to return all projects and sites."),
+    },
     outputSchema: {
       projects: z.array(z.object({
         id: z.number(),
         name: z.string(),
         description: z.string().nullable(),
-        sites_count: z.number(),
+        sites: z.array(siteSchema),
       })),
+      sites_without_project: z.array(siteSchema),
+      summary: z.object({
+        total_sites: z.number(),
+        up: z.number(),
+        down: z.number(),
+        pending: z.number(),
+        avg_uptime: z.number().nullable(),
+        avg_response_time: z.number().nullable(),
+      }),
     },
-  }, async () => {
+  }, async ({ project_id }) => {
     try {
-      const response = await apiClient.get("/projects");
-      const projects = response.data.data.map((p: any) => ({
-        id: p.id,
-        name: p.name,
-        description: p.description ?? null,
-        sites_count: p.sites_count,
-      }));
+      const params: Record<string, number> = {};
+      if (project_id) params.project_id = project_id;
+      const response = await apiClient.get("/mcp/overview", { params });
+      const { projects, sites_without_project, summary } = response.data.data;
       return {
-        content: [{ type: "text", text: JSON.stringify(projects, null, 2) }],
-        structuredContent: { projects },
+        content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
+        structuredContent: { projects, sites_without_project, summary },
       };
     } catch (error: any) {
       return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
@@ -103,16 +96,35 @@ function createServer(apiToken: string) {
 
   server.registerTool("digipulse_get_site_history", {
     title: "Get Site History",
-    description: "Get hourly aggregated stats and downtime incidents for a site. Defaults to current week.",
+    description: `Returns the full history of a single site: hourly or daily aggregated stats and all incidents for the requested time window.
+
+Use this after digipulse_get_overview when you need to:
+- Show a response-time chart for a specific site
+- List all incidents in a date range
+- Compare performance across different periods
+
+Use granularity "day" for ranges longer than 2 weeks to reduce data volume.`,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
-      site_id: z.number(),
-      week: z.string().optional().describe("ISO week string, e.g. 2025-W20"),
+      site_id: z.number().describe("ID of the site to retrieve. Get this from digipulse_get_overview."),
+      from: z.string().optional().describe("Start date inclusive. Format: YYYY-MM-DD. Defaults to 7 days ago."),
+      to: z.string().optional().describe("End date inclusive. Format: YYYY-MM-DD. Defaults to today."),
+      granularity: z.enum(["hour", "day"]).optional().describe("Aggregation granularity. Use 'day' for ranges longer than 2 weeks. Defaults to 'hour'."),
     },
     outputSchema: {
+      site_id: z.number(),
+      from: z.string(),
+      to: z.string(),
       stats: z.array(z.object({
         timestamp: z.string(),
         avg_response_time: z.number(),
         uptime_percentage: z.number(),
+        count: z.number(),
       })),
       incidents: z.array(z.object({
         checked_at: z.string(),
@@ -120,26 +132,71 @@ function createServer(apiToken: string) {
         error: z.string().nullable(),
       })),
     },
-  }, async ({ site_id, week }) => {
+  }, async ({ site_id, from, to, granularity }) => {
     try {
-      const params = week ? { week } : {};
-      const response = await apiClient.get(`/sites/${site_id}/history`, { params });
-      const { stats, incidents } = response.data.data;
-      const result = {
-        stats: (stats ?? []).map((s: any) => ({
-          timestamp: s.timestamp,
-          avg_response_time: s.avg_response_time,
-          uptime_percentage: s.uptime_percentage,
-        })),
-        incidents: (incidents ?? []).slice(0, 20).map((i: any) => ({
-          checked_at: i.checked_at,
-          response_time_ms: i.response_time_ms ?? null,
-          error: i.error ?? null,
-        })),
-      };
+      const params: Record<string, string> = {};
+      if (from) params.from = from;
+      if (to) params.to = to;
+      if (granularity) params.granularity = granularity;
+      const response = await apiClient.get(`/mcp/sites/${site_id}/history`, { params });
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        structuredContent: result,
+        content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
+        structuredContent: response.data.data,
+      };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  });
+
+  server.registerTool("digipulse_get_incidents", {
+    title: "Get Incidents",
+    description: `Returns a paginated cross-site list of downtime incidents sorted newest-first. Each incident includes the affected site name, project, timestamp, response time, and error message.
+
+Use this to answer questions like:
+- "What went down this week?"
+- "Show all incidents for project X"
+- "How many outages did site Y have last month?"
+
+Defaults to the last 7 days with a limit of 50 items.`,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      project_id: z.number().optional().describe("Optional. Filter to incidents within a specific project."),
+      site_id: z.number().optional().describe("Optional. Filter to incidents for a specific site."),
+      from: z.string().optional().describe("Start date inclusive. Format: YYYY-MM-DD. Defaults to 7 days ago."),
+      to: z.string().optional().describe("End date inclusive. Format: YYYY-MM-DD. Defaults to today."),
+      limit: z.number().min(1).max(200).optional().describe("Maximum number of incidents to return. Default 50, max 200."),
+      offset: z.number().min(0).optional().describe("Pagination offset. Default 0."),
+    },
+    outputSchema: {
+      incidents: z.array(z.object({
+        site_id: z.number(),
+        site_name: z.string().nullable(),
+        site_url: z.string().nullable(),
+        project_id: z.number().nullable(),
+        checked_at: z.string(),
+        response_time_ms: z.number().nullable(),
+        error: z.string().nullable(),
+      })),
+      total: z.number(),
+    },
+  }, async ({ project_id, site_id, from, to, limit, offset }) => {
+    try {
+      const params: Record<string, string | number> = {};
+      if (project_id) params.project_id = project_id;
+      if (site_id) params.site_id = site_id;
+      if (from) params.from = from;
+      if (to) params.to = to;
+      if (limit) params.limit = limit;
+      if (offset) params.offset = offset;
+      const response = await apiClient.get("/mcp/incidents", { params });
+      return {
+        content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
+        structuredContent: response.data.data,
       };
     } catch (error: any) {
       return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
@@ -175,11 +232,13 @@ function createServer(apiToken: string) {
       content: {
         type: "text",
         text: `Please run a comprehensive health audit on my DigiPulse monitored sites${projectId ? ` for project ID ${projectId}` : ''}.
-First, use the 'digipulse_list_sites' tool to retrieve the current statuses.
-Then, generate a report highlighting:
+First, use the 'digipulse_get_overview' tool to retrieve the current statuses and SSL info.
+Then, use 'digipulse_get_incidents' to check recent downtime${projectId ? ` for project_id ${projectId}` : ''}.
+Generate a report highlighting:
 1. Sites that are currently DOWN.
-2. Sites with high latency or SSL issues.
-3. A general summary of the infrastructure health.`
+2. Sites with high latency or SSL issues (expiring soon or invalid).
+3. Recent incidents summary.
+4. A general infrastructure health score.`
       }
     }]
   }));

@@ -1,6 +1,6 @@
 # DigiPulse MCP Server
 
-MCP server for DigiPulse — gives AI agents (Cline, Claude Desktop, Cursor) read access to your monitoring data.
+MCP server for DigiPulse — gives AI agents (Claude Code, Cline, Claude Desktop, Cursor) read access to your monitoring data.
 
 ## Transport
 
@@ -40,6 +40,31 @@ PORT=3001
 
 ## Connecting Agents
 
+### Claude Code
+
+```bash
+claude mcp add --transport http digipulse http://localhost:3001/mcp --header "Authorization: Bearer YOUR_API_TOKEN"
+```
+
+Or add manually to one of:
+
+- `~/.claude.json` — user-level, available in all projects
+- `.mcp.json` in project root — project-level only
+
+```json
+{
+  "mcpServers": {
+    "digipulse": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_TOKEN"
+      }
+    }
+  }
+}
+```
+
 ### Cline
 
 Add to `cline_mcp_settings.json`:
@@ -58,22 +83,14 @@ Add to `cline_mcp_settings.json`:
 }
 ```
 
-### Claude Desktop
+### Claude Desktop (claude.ai)
 
-Add to `claude_desktop_config.json`:
+Claude Desktop does not support HTTP servers via config file. Use **Custom Connectors** instead:
 
-```json
-{
-  "mcpServers": {
-    "digipulse": {
-      "url": "http://localhost:3001/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_TOKEN"
-      }
-    }
-  }
-}
-```
+1. Open [claude.ai](https://claude.ai) → Settings → Connectors
+2. Click **Add custom connector**
+3. Enter the server URL: `http://localhost:3001/mcp?token=YOUR_API_TOKEN`
+4. Click **Save**
 
 ### Testing with MCP Inspector
 
@@ -85,11 +102,34 @@ Open the Inspector UI → set transport to **Streamable HTTP** → connect to `h
 
 ## Available Tools
 
-| Tool | Description |
-|------|-------------|
-| `digipulse_list_sites` | All monitored sites with status, uptime, response time, SSL info |
-| `digipulse_list_projects` | All projects with site count |
-| `digipulse_get_site_history` | Hourly stats and downtime incidents for a site (by week) |
+### `digipulse_get_overview`
+Returns all projects with their sites, current status, uptime, SSL info, and a summary. Use this as the default first call — answers most monitoring questions in one request.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `project_id` | number? | Filter results to a single project |
+
+### `digipulse_get_site_history`
+Returns hourly or daily aggregated stats and downtime incidents for a site by date range.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `site_id` | number | Site ID (from `get_overview`) |
+| `from` | string? | Start date `YYYY-MM-DD`, defaults to 7 days ago |
+| `to` | string? | End date `YYYY-MM-DD`, defaults to today |
+| `granularity` | `hour\|day`? | Aggregation granularity, use `day` for ranges > 2 weeks |
+
+### `digipulse_get_incidents`
+Returns a paginated cross-site list of downtime incidents sorted newest-first.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `project_id` | number? | Filter by project |
+| `site_id` | number? | Filter by site |
+| `from` | string? | Start date `YYYY-MM-DD`, defaults to 7 days ago |
+| `to` | string? | End date `YYYY-MM-DD`, defaults to today |
+| `limit` | number? | Max results, default 50, max 200 |
+| `offset` | number? | Pagination offset, default 0 |
 
 ## Available Resources
 
@@ -107,5 +147,6 @@ Open the Inspector UI → set transport to **Streamable HTTP** → connect to `h
 
 - *"What is the current status of my monitored sites?"*
 - *"Show me sites that are down or have SSL issues."*
-- *"Analyze the uptime history for site 5 this week."*
+- *"Show response time history for site 3 over the last 30 days."*
+- *"What incidents happened this week across all projects?"*
 - *"Run a full infrastructure health audit."*

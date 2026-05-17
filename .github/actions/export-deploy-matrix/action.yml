@@ -1,0 +1,42 @@
+name: Export deploy matrix from repository variables
+description: Passes DEPLOYMENT_MATRIX JSON variable to strategy.matrix.server. Set DEPLOYMENT_MATRIX in GitHub Variables as a JSON array, e.g. [{"name":"prod","ip":"1.2.3.4","port":"22","username":"deploy","path":"/var/www"}].
+
+inputs:
+  deployment_matrix:
+    description: DEPLOYMENT_MATRIX — JSON array of server objects (name, ip, port, username, path)
+    required: true
+
+outputs:
+  DEPLOYMENT_MATRIX:
+    description: JSON array for strategy.matrix.server
+    value: ${{ steps.export.outputs.DEPLOYMENT_MATRIX }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate and export matrix JSON
+      id: export
+      shell: bash
+      env:
+        DEPLOYMENT_MATRIX: ${{ inputs.deployment_matrix }}
+      run: |
+        set -euo pipefail
+        if [ -z "${DEPLOYMENT_MATRIX:-}" ]; then
+          echo "DEPLOYMENT_MATRIX variable is empty. Set it in GitHub Variables as a JSON array."
+          exit 1
+        fi
+        if ! echo "$DEPLOYMENT_MATRIX" | jq -e 'if type == "array" and length > 0 then . else error end' > /dev/null 2>&1; then
+          echo "DEPLOYMENT_MATRIX must be a non-empty JSON array."
+          exit 1
+        fi
+        FILTERED="$(echo "$DEPLOYMENT_MATRIX" | jq '[.[] | select(.enabled != false)]')"
+        if [ "$(echo "$FILTERED" | jq 'length')" -eq 0 ]; then
+          echo "No servers are enabled. Set enabled: true on at least one server in DEPLOYMENT_MATRIX."
+          exit 1
+        fi
+        delimiter="$(openssl rand -hex 8)"
+        {
+          echo "DEPLOYMENT_MATRIX<<${delimiter}"
+          echo "$FILTERED"
+          echo "${delimiter}"
+        } >> "${GITHUB_OUTPUT}"
