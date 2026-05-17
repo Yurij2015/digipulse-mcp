@@ -40,7 +40,7 @@ function createServer(apiToken: string) {
     response_time: z.number().nullable(),
     last_checked_at: z.string().nullable(),
     project_id: z.number().nullable(),
-    project_name: z.string().nullable(),
+    project_name: z.string().nullable().optional(),
     ssl_valid: z.boolean().nullable(),
     ssl_expires_at: z.string().nullable(),
     ssl_days_remaining: z.number().nullable(),
