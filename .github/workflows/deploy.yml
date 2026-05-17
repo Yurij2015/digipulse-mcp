@@ -26,6 +26,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate .env from repository variables
+        env:
+          DIGIPULSE_API_URL: ${{ vars.DIGIPULSE_API_URL }}
+          DIGIPULSE_FRONTEND_KEY: ${{ secrets.DIGIPULSE_FRONTEND_KEY }}
+        run: |
+          printf 'DIGIPULSE_API_URL=%s\n' "${DIGIPULSE_API_URL}" > .env
+          printf 'DIGIPULSE_FRONTEND_KEY=%s\n' "${DIGIPULSE_FRONTEND_KEY}" >> .env
+
       - name: Build project
         run: npm run build
 
@@ -33,7 +41,7 @@ jobs:
         env:
           GITHUB_SHA: ${{ github.sha }}
         run: |
-          tar -czf "${GITHUB_SHA}.tar.gz" --exclude=.git --exclude='./node_modules' dist package.json package-lock.json
+          tar -czf "${GITHUB_SHA}.tar.gz" --exclude=.git --exclude='./node_modules' .env dist package.json package-lock.json
 
       - name: Store artifact for distribution
         uses: actions/upload-artifact@v7
