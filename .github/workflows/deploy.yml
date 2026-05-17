@@ -30,9 +30,11 @@ jobs:
         env:
           DIGIPULSE_API_URL: ${{ vars.DIGIPULSE_API_URL }}
           DIGIPULSE_FRONTEND_KEY: ${{ secrets.DIGIPULSE_FRONTEND_KEY }}
+          REDIS_URL: ${{ vars.REDIS_URL }}
         run: |
           printf 'DIGIPULSE_API_URL=%s\n' "${DIGIPULSE_API_URL}" > .env
           printf 'DIGIPULSE_FRONTEND_KEY=%s\n' "${DIGIPULSE_FRONTEND_KEY}" >> .env
+          printf 'REDIS_URL=%s\n' "${REDIS_URL}" >> .env
 
       - name: Build project
         run: npm run build

@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import axios from "axios";
 import { randomUUID } from "crypto";
+import { Redis } from "ioredis";
 
 const USE_HTTP = !!process.env.PORT;
 
@@ -14,8 +15,28 @@ if (USE_HTTP) {
 
 const API_URL = process.env.DIGIPULSE_API_URL || "http://localhost/api/v1";
 const FRONTEND_KEY = process.env.DIGIPULSE_FRONTEND_KEY || "digipulse_development_key";
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+
+const redis = new Redis(REDIS_URL, { lazyConnect: true, enableOfflineQueue: false });
+redis.connect().catch(() => {});
+
+async function getCached<T>(key: string): Promise<T | null> {
+  try {
+    const val = await redis.get(key);
+    return val ? (JSON.parse(val) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setCached(key: string, data: unknown, ttlMs: number): Promise<void> {
+  try {
+    await redis.set(key, JSON.stringify(data), "PX", ttlMs);
+  } catch {}
+}
 
 function createServer(apiToken: string) {
+  const tokenKey = apiToken.slice(-8) || "anon";
   const apiClient = axios.create({
     baseURL: API_URL,
     headers: {
@@ -83,7 +104,16 @@ Optionally filter to a single project with project_id.`,
     try {
       const params: Record<string, number> = {};
       if (project_id) params.project_id = project_id;
+      const cacheKey = `${tokenKey}:overview:${project_id ?? "all"}`;
+      const cached = await getCached<typeof response.data.data>(cacheKey);
+      if (cached) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(cached, null, 2) }],
+          structuredContent: cached as any,
+        };
+      }
       const response = await apiClient.get("/mcp/overview", { params });
+      setCached(cacheKey, response.data.data, 60_000);
       const { projects, sites_without_project, summary } = response.data.data;
       return {
         content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
@@ -138,7 +168,16 @@ Use granularity "day" for ranges longer than 2 weeks to reduce data volume.`,
       if (from) params.from = from;
       if (to) params.to = to;
       if (granularity) params.granularity = granularity;
+      const cacheKey = `${tokenKey}:history:${site_id}:${from ?? ""}:${to ?? ""}:${granularity ?? "hour"}`;
+      const cached = await getCached<unknown>(cacheKey);
+      if (cached) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(cached, null, 2) }],
+          structuredContent: cached as any,
+        };
+      }
       const response = await apiClient.get(`/mcp/sites/${site_id}/history`, { params });
+      setCached(cacheKey, response.data.data, 10 * 60_000);
       return {
         content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
         structuredContent: response.data.data,
@@ -193,7 +232,16 @@ Defaults to the last 7 days with a limit of 50 items.`,
       if (to) params.to = to;
       if (limit) params.limit = limit;
       if (offset) params.offset = offset;
+      const cacheKey = `${tokenKey}:incidents:${project_id ?? ""}:${site_id ?? ""}:${from ?? ""}:${to ?? ""}:${limit ?? 50}:${offset ?? 0}`;
+      const cached = await getCached<unknown>(cacheKey);
+      if (cached) {
+        return {
+          content: [{ type: "text", text: JSON.stringify(cached, null, 2) }],
+          structuredContent: cached as any,
+        };
+      }
       const response = await apiClient.get("/mcp/incidents", { params });
+      setCached(cacheKey, response.data.data, 60_000);
       return {
         content: [{ type: "text", text: JSON.stringify(response.data.data, null, 2) }],
         structuredContent: response.data.data,
