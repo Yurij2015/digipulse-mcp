@@ -1,0 +1,279 @@
+name: Deploy DigiPulse MCP Server (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - testing
+          - all
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        default: 'main'
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  create-deployment-artifacts:
+    name: Create deployment artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      DEPLOYMENT_MATRIX: ${{ steps.filter.outputs.DEPLOYMENT_MATRIX }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Create deployment artifact
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          tar -czf "${GITHUB_SHA}.tar.gz" --exclude=.git --exclude='./node_modules' dist package.json package-lock.json
+
+      - name: Store artifact for distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-build
+          path: ${{ github.sha }}.tar.gz
+          retention-days: 7
+
+      - name: Export deployment matrix
+        id: export
+        uses: ./.github/actions/export-deploy-matrix
+        with:
+          deployment_matrix: ${{ vars.DEPLOYMENT_MATRIX }}
+
+      - name: Filter by environment
+        id: filter
+        env:
+          FILTER_ENV: ${{ github.event.inputs.environment }}
+          FULL_MATRIX: ${{ steps.export.outputs.DEPLOYMENT_MATRIX }}
+        run: |
+          if [ "$FILTER_ENV" = "all" ]; then
+            FILTERED="$FULL_MATRIX"
+          else
+            FILTERED=$(echo "$FULL_MATRIX" | jq --arg env "$FILTER_ENV" '[.[] | select(.environment == $env)]')
+          fi
+          if [ "$(echo "$FILTERED" | jq 'length')" -eq 0 ]; then
+            echo "No server found for environment: $FILTER_ENV"
+            exit 1
+          fi
+          delimiter="$(openssl rand -hex 8)"
+          {
+            echo "DEPLOYMENT_MATRIX<<${delimiter}"
+            echo "$FILTERED"
+            echo "${delimiter}"
+          } >> "${GITHUB_OUTPUT}"
+
+  prepare-release-on-servers:
+    name: "${{ matrix.server.name }}: Prepare release"
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.server.environment }}
+    needs: create-deployment-artifacts
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.DEPLOYMENT_MATRIX) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: app-build
+
+      - name: Generate .env
+        env:
+          DIGIPULSE_API_URL: ${{ vars.DIGIPULSE_API_URL }}
+          DIGIPULSE_FRONTEND_KEY: ${{ secrets.DIGIPULSE_FRONTEND_KEY }}
+          REDIS_URL: ${{ vars.REDIS_URL }}
+        run: |
+          printf 'DIGIPULSE_API_URL=%s\n' "${DIGIPULSE_API_URL}" > .env
+          printf 'DIGIPULSE_FRONTEND_KEY=%s\n' "${DIGIPULSE_FRONTEND_KEY}" >> .env
+          printf 'REDIS_URL=%s\n' "${REDIS_URL}" >> .env
+
+      - name: Bootstrap server directories
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          script: |
+            mkdir -p "${{ matrix.server.path }}/releases" "${{ matrix.server.path }}/artifacts"
+
+      - name: Upload artifact and .env to server
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          source: "${{ github.sha }}.tar.gz,.env"
+          target: ${{ matrix.server.path }}/artifacts
+
+      - name: Extract archive and place .env
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA
+          script: |
+            set -e
+            RELEASE_PATH="${{ matrix.server.path }}/releases/${GITHUB_SHA}"
+            ARTIFACT_PATH="${{ matrix.server.path }}/artifacts/${GITHUB_SHA}.tar.gz"
+
+            mkdir -p "$RELEASE_PATH"
+            tar xzf "$ARTIFACT_PATH" --no-same-owner --no-same-permissions -C "$RELEASE_PATH"
+            mv "${{ matrix.server.path }}/artifacts/.env" "$RELEASE_PATH/.env"
+            docker run --rm -v "$RELEASE_PATH:/app" -w /app node:22 npm ci --omit=dev
+
+  run-before-hooks:
+    name: "${{ matrix.server.name }}: Before hook"
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.server.environment }}
+    needs: [create-deployment-artifacts, prepare-release-on-servers]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.DEPLOYMENT_MATRIX) }}
+    steps:
+      - name: Run before hooks
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_PATH: ${{ matrix.server.path }}/releases/${{ github.sha }}
+          ACTIVE_RELEASE_PATH: ${{ matrix.server.path }}/current
+          BASE_PATH: ${{ matrix.server.path }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA,RELEASE_PATH,ACTIVE_RELEASE_PATH,BASE_PATH
+          script: |
+            if [ -n "${{ vars.DEPLOY_BEFORE_HOOKS }}" ]; then
+              eval "${{ vars.DEPLOY_BEFORE_HOOKS }}"
+            fi
+
+  activate-release:
+    name: "${{ matrix.server.name }}: Activate release"
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.server.environment }}
+    needs: [create-deployment-artifacts, prepare-release-on-servers, run-before-hooks]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.DEPLOYMENT_MATRIX) }}
+    steps:
+      - name: Activate release
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_PATH: ${{ matrix.server.path }}/releases/${{ github.sha }}
+          ACTIVE_RELEASE_PATH: ${{ matrix.server.path }}/current
+          BASE_PATH: ${{ matrix.server.path }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA,RELEASE_PATH,ACTIVE_RELEASE_PATH,BASE_PATH
+          script: |
+            if [ -d "$ACTIVE_RELEASE_PATH" ] && [ ! -L "$ACTIVE_RELEASE_PATH" ]; then
+              rm -rf "$ACTIVE_RELEASE_PATH"
+            fi
+            ln -sfn "$RELEASE_PATH" "$ACTIVE_RELEASE_PATH"
+
+  run-after-hooks:
+    name: "${{ matrix.server.name }}: After hook"
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.server.environment }}
+    needs: [create-deployment-artifacts, prepare-release-on-servers, run-before-hooks, activate-release]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.DEPLOYMENT_MATRIX) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.branch }}
+      - name: Run after deploy
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_PATH: ${{ matrix.server.path }}/releases/${{ github.sha }}
+          ACTIVE_RELEASE_PATH: ${{ matrix.server.path }}/current
+          BASE_PATH: ${{ matrix.server.path }}
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          envs: GITHUB_SHA,RELEASE_PATH,ACTIVE_RELEASE_PATH,BASE_PATH
+          script_path: .github/scripts/after-deploy.sh
+      - name: Optional extra after deploy commands
+        if: ${{ vars.DEPLOY_AFTER_HOOKS != '' }}
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          script: |
+            set -euo pipefail
+            eval "${{ vars.DEPLOY_AFTER_HOOKS }}"
+
+  clean-up:
+    name: "${{ matrix.server.name }}: Clean up"
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.server.environment }}
+    needs: [create-deployment-artifacts, prepare-release-on-servers, run-before-hooks, activate-release, run-after-hooks]
+    strategy:
+      matrix:
+        server: ${{ fromJson(needs.create-deployment-artifacts.outputs.DEPLOYMENT_MATRIX) }}
+    steps:
+      - name: Clean old releases and artifacts
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          RELEASES_PATH: ${{ matrix.server.path }}/releases
+          ARTIFACTS_PATH: ${{ matrix.server.path }}/artifacts
+        with:
+          host: ${{ matrix.server.ip }}
+          username: ${{ matrix.server.username }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ matrix.server.port }}
+          envs: RELEASES_PATH,ARTIFACTS_PATH
+          script: |
+            cd "$RELEASES_PATH" && ls -t -1 | tail -n +6 | xargs rm -rf || true
+            cd "$ARTIFACTS_PATH" && ls -t -1 | tail -n +6 | xargs rm -rf || true
+
+  delete-artifact:
+    name: Delete GitHub artifact
+    runs-on: ubuntu-latest
+    needs: [create-deployment-artifacts, clean-up]
+    if: always()
+    steps:
+      - name: Delete artifact
+        uses: geekyeggo/delete-artifact@v6.0.0
+        with:
+          name: app-build
+          failOnError: false
